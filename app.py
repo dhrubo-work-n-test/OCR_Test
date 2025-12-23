@@ -1,134 +1,175 @@
 import streamlit as st
+import fitz  # PyMuPDF
+import pytesseract
 import cv2
 import numpy as np
-import pytesseract
-from pdf2image import convert_from_bytes
+import re
 from PIL import Image
-import tempfile
-import json
 
-# =========================
-# OCR PREPROCESSING
-# =========================
+# =====================================================
+# STREAMLIT CONFIG
+# =====================================================
+
+st.set_page_config(page_title="Trade Compliance OCR Test", layout="wide")
+st.title("📄 Trade Compliance OCR – Extraction Test Harness")
+
+# =====================================================
+# IMAGE PREPROCESSING
+# =====================================================
 
 def preprocess_image(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     gray = cv2.fastNlMeansDenoising(gray, None, 30, 7, 21)
-    thresh = cv2.adaptiveThreshold(
-        gray, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 11, 2
-    )
-    return thresh
+    return gray
 
-def ocr_image(img):
-    config = "--oem 3 --psm 6"
-    text = pytesseract.image_to_string(img, config=config)
-    return text.splitlines()
-
-# =========================
-# OCR PIPELINE
-# =========================
+# =====================================================
+# OCR PIPELINE (PDF → TEXT)
+# =====================================================
 
 def run_ocr(uploaded_file):
-    pages = convert_from_bytes(uploaded_file.read(), dpi=300)
-    all_pages = []
+    pdf_bytes = uploaded_file.read()
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-    for idx, page in enumerate(pages):
-        img = np.array(page)
-        img = preprocess_image(img)
-        raw_text = ocr_image(img)
+    pages = []
 
-        all_pages.append({
-            "page": idx + 1,
-            "raw_text": raw_text
+    for page_num in range(len(doc)):
+        page = doc.load_page(page_num)
+        pix = page.get_pixmap(matrix=fitz.Matrix(3, 3))  # ~300 DPI
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        img = preprocess_image(np.array(img))
+
+        text = pytesseract.image_to_string(img, config="--oem 3 --psm 6")
+
+        pages.append({
+            "page": page_num + 1,
+            "raw_text": text.splitlines()
         })
 
-    return all_pages
+    return pages
 
-# =========================
-# DOCUMENT SUBTYPE
-# (same logic as your lambda)
-# =========================
+# =====================================================
+# DOC SUBTYPE LOGIC (UNCHANGED)
+# =====================================================
 
-def doc_subtype(raw_text):
-    text = " ".join(raw_text)
-
-    if any(k in text for k in ["OMB APPROVAL NO", "ENTRY SUMMARY"]):
-        return "7501"
-    if any(k in text for k in ["INVOICE", "Commercial Invoice", "PROFORMA"]):
-        return "invoice"
+def doc_subtype(raw_text, doc_subtype_keyword):
+    for i in doc_subtype_keyword:
+        key_word = doc_subtype_keyword[i]
+        for j in key_word:
+            if re.search(j, str(raw_text)):
+                return i.strip("d_")
     return "unknown"
 
-# =========================
-# PLACEHOLDERS FOR YOUR LOGIC
-# =========================
+# =====================================================
+# MOCK WRAPPERS (REPLACE LATER)
+# =====================================================
 
-def import_wrapper_invoice(raw_text):
-    return {
-        "Invoice Number": "EXTRACTED_VALUE",
-        "LineItems": []
-    }
+def mock_invoice_wrapper(raw_text):
+    return [
+        "INV-TEST",
+        "Importer Name",
+        "USD",
+        ["HTS123"],
+        ["100"],
+        ["DESC"],
+        ["US"],
+        ["10"],
+        ["PCS"],
+        "TOTAL",
+        ["PART-1"]
+    ]
 
-def import_wrapper_7501(raw_text):
-    return {
-        "Entry Number": "EXTRACTED_VALUE"
-    }
+def mock_7501_wrapper(raw_text):
+    return [
+        "ENTRY123",
+        "AWB123",
+        "BROKER",
+        ["HTS123"],
+        ["100"],
+        ["5"],
+        ["1"]
+    ]
 
-# =========================
+# =====================================================
+# JSON FORMATTERS (UNCHANGED CORE STRUCTURE)
+# =====================================================
+
+def json_format_import(result):
+    obj = {"Entry Number": "", "AWB Number": "", "Broker Name": "", "LineItems": {"LineItemDetails": []}}
+
+    for k in result:
+        if k.endswith("7501"):
+            obj["Entry Number"] = result[k][0]
+            obj["AWB Number"] = result[k][1]
+            obj["Broker Name"] = result[k][2]
+
+        if k.endswith("invoice"):
+            for i in range(len(result[k][3])):
+                obj["LineItems"]["LineItemDetails"].append({
+                    "HTS": result[k][3][i],
+                    "Value": result[k][4][i],
+                    "Description": result[k][5][i]
+                })
+
+    return obj
+
+# =====================================================
 # MAIN PROCESSOR
-# =========================
+# =====================================================
 
-def process_document(pages, document_type):
+def process_pages(pages, document_type):
+    doc_subtype_keyword = {
+        "d_7501": [
+            "OMB APPROVAL NO",
+            "ENTRY SUMMARY",
+            "Form Approved OMB"
+        ],
+        "d_invoice": [
+            "INVOICE",
+            "COMMERCIAL INVOICE",
+            "PROFORMA"
+        ]
+    }
+
     result = {}
 
-    for page in pages:
-        raw_text = page["raw_text"]
-        subtype = doc_subtype(raw_text)
+    for p in pages:
+        raw_text = p["raw_text"]
+        subtype = doc_subtype(raw_text, doc_subtype_keyword)
 
         if subtype == "invoice":
-            if document_type == "import":
-                invoice = import_wrapper_invoice(raw_text)
-                result[f"page_{page['page']}_invoice"] = invoice
-
+            result[f"page_{p['page']}_invoice"] = mock_invoice_wrapper(raw_text)
         elif subtype == "7501":
-            if document_type == "import":
-                f7501 = import_wrapper_7501(raw_text)
-                result[f"page_{page['page']}_7501"] = f7501
+            result[f"page_{p['page']}_7501"] = mock_7501_wrapper(raw_text)
+
+    if document_type == "import":
+        return json_format_import(result)
 
     return result
 
-# =========================
-# STREAMLIT UI
-# =========================
+# =====================================================
+# UI
+# =====================================================
 
-st.set_page_config(page_title="Trade Compliance OCR", layout="wide")
-
-st.title("📄 Trade Compliance OCR Demo")
-
-doc_type = st.selectbox(
-    "Select Document Type",
-    ["import", "export", "recon", "drawback"]
-)
-
-uploaded_file = st.file_uploader(
-    "Upload PDF Document",
-    type=["pdf"]
-)
+doc_type = st.selectbox("Document Type", ["import", "export", "recon", "drawback"])
+uploaded_file = st.file_uploader("Upload PDF", type=["pdf"])
 
 if uploaded_file:
     with st.spinner("Running OCR..."):
         pages = run_ocr(uploaded_file)
 
-    st.success(f"OCR completed for {len(pages)} pages")
+    st.success(f"OCR completed: {len(pages)} pages")
 
     with st.spinner("Running extraction logic..."):
-        extracted_result = process_document(pages, doc_type)
+        output = process_pages(pages, doc_type)
 
-    st.subheader("📦 Extracted JSON")
-    st.json(extracted_result)
+    col1, col2 = st.columns(2)
 
-    st.subheader("📝 OCR Preview")
-    for p in pages:
-        with st.expander(f"Page {p['page']}"):
-            st.text("\n".join(p["raw_text"]))
+    with col1:
+        st.subheader("📦 Extracted JSON")
+        st.json(output)
+
+    with col2:
+        st.subheader("📝 OCR Preview")
+        for p in pages:
+            with st.expander(f"Page {p['page']}"):
+                st.text("\n".join(p["raw_text"]))
